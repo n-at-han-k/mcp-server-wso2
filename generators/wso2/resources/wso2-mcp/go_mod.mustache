@@ -1,0 +1,8 @@
+module github.com/{{gitUserId}}/{{gitRepoId}}
+
+go 1.25
+
+// The official MCP SDK. bin/generate runs `go mod tidy` after this file is
+// written -- only the toolchain knows the hashes, and the Dockerfile builds
+// with no network for the module cache.
+require github.com/modelcontextprotocol/go-sdk v1.8.0

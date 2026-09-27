@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# The whole build: four WSO2 documents in, one MCP server out.
+#
+# What lands in the repo is COMMITTED -- the Dockerfile compiles what is here,
+# not what a regeneration would produce. Run this, look at the diff, commit it.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+SPECS=reference/identity-api-server/components
+TENANT=$SPECS/org.wso2.carbon.identity.api.server.tenant.management/org.wso2.carbon.identity.api.server.tenant.management.v1/src/main/resources/tenant-management.yaml
+ORG=$SPECS/org.wso2.carbon.identity.api.server.organization.management/org.wso2.carbon.identity.api.server.organization.management.v1/src/main/resources/org.wso2.carbon.identity.organization.management.yaml
+APP=$SPECS/org.wso2.carbon.identity.api.server.application.management/org.wso2.carbon.identity.api.server.application.management.v1/src/main/resources/applications.yaml
+# Connections: the external identity providers a tenant federates to, which is
+# what "sign in with Google" is.
+IDP=$SPECS/org.wso2.carbon.identity.api.server.idp/org.wso2.carbon.identity.api.server.idp.v1/src/main/resources/idp.yaml
+
+for spec in "$TENANT" "$ORG" "$APP" "$IDP"; do
+  test -f "$spec" || { echo "missing $spec -- see reference/ in the README"; exit 1; }
+done
+
+MERGED=$(mktemp -t wso2-merged-XXXXXX.yaml)
+ANNOTATED=$(mktemp -t wso2-annotated-XXXXXX.yaml)
+trap 'rm -f "$MERGED" "$ANNOTATED"' EXIT
+
+bin/merge-specs "$MERGED" \
+  tenant="$TENANT" \
+  organization="$ORG" \
+  application="$APP" \
+  idp="$IDP"
+
+# What each tool ACCEPTS is a dereferenced JSON Schema -- a schema walk, which
+# travels in the document rather than in a template.
+bin/annotate "$MERGED" "$ANNOTATED"
+
+# NO FILTER. The documents describe the whole API, and an operation left out is
+# a thing nobody can call. A client that finds a hundred-odd tools too many can hide some;
+# one that never saw them cannot.
+
+# A rename leaves the old file behind, and stale generated Go compiles just as
+# well as the new.
+rm -rf internal/wso2
+
+openapi-generator-wso2-mcp generate \
+  -i "$ANNOTATED" \
+  -g wso2-mcp \
+  -o . \
+  --git-host github.com \
+  --git-user-id n-at-han-k \
+  --git-repo-id mcp-server-wso2
+
+# The generator cannot write a go.sum -- only the toolchain knows the hashes,
+# and the Dockerfile builds with no network for the module cache.
+CGO_ENABLED=0 go mod tidy
+
+CGO_ENABLED=0 go build ./...
+CGO_ENABLED=0 go test ./...
+echo "built clean"

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Annotate every operation with the JSON Schema its MCP tool takes.
+
+A tool's inputSchema is the operation's parameters and its request body as ONE
+object, fully dereferenced: MCP clients are given the schema verbatim and a
+`$ref` pointing into a document they never saw resolves to nothing.
+
+That resolution is a schema walk, which no mustache template can do and which
+the Java generator would have to re-implement against swagger-parser's model.
+So it travels in the document instead -- `x-mcp-schema`, `x-mcp-path-params`,
+`x-mcp-query-params`, `x-mcp-body` -- and the templates only print.
+
+    bin/annotate merged.yaml annotated.yaml
+"""
+
+import json
+import sys
+
+import yaml
+
+# Every verb openapi-generator will hand the template, not only the four
+# that carry a body: /tenants/domain/{tenantDomain} is a HEAD, and an
+# operation this list misses reaches tools.go with no schema at all.
+VERBS = ("get", "put", "post", "delete", "patch", "options", "head", "trace")
+
+# WSO2 schemas point at each other in both directions -- an Application holds
+# an AuthenticationSequence holding Steps holding Authenticators -- so a
+# dereference has to stop somewhere. A ref already open in this branch becomes
+# a bare object: the shape is unknowable at that depth anyway, and a client that
+# recursed with us would never finish.
+CYCLE = {"type": "object", "description": "recursive schema, passed through as-is"}
+
+# A description arrives as documentation and leaves inside a Go raw string
+# literal. A backtick in it would end that literal, and ` is not an escape
+# Go's raw strings know.
+def clean(text):
+    return str(text).replace("`", "'").strip()
+
+
+def deref(node, doc, seen):
+    """Resolve $refs in place, refusing to walk into one already open."""
+    if isinstance(node, list):
+        return [deref(item, doc, seen) for item in node]
+
+    if not isinstance(node, dict):
+        return node
+
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen:
+            return dict(CYCLE)
+
+        target = doc
+        for step in ref.lstrip("#/").split("/"):
+            target = target.get(step, {})
+
+        resolved = deref(target, doc, seen | {ref})
+        # Anything beside the $ref -- a description at the point of use -- wins,
+        # as it does in OpenAPI 3.1.
+        resolved.update({k: v for k, v in node.items() if k != "$ref"})
+        return resolved
+
+    return {key: deref(value, doc, seen) for key, value in node.items()}
+
+
+def body_schema(operation, doc):
+    content = operation.get("requestBody", {}).get("content", {})
+    for media, entry in content.items():
+        if "json" in media and "schema" in entry:
+            return deref(entry["schema"], doc, frozenset())
+    return None
+
+
+def annotate(doc):
+    tools = 0
+
+    for path, item in doc.get("paths", {}).items():
+        shared = item.get("parameters", [])
+
+        for verb in VERBS:
+            operation = item.get(verb)
+            if not isinstance(operation, dict):
+                continue
+
+            properties = {}
+            required = []
+            path_params = []
+            query_params = []
+
+            for parameter in shared + operation.get("parameters", []):
+                parameter = deref(parameter, doc, frozenset())
+                name = parameter.get("name")
+                where = parameter.get("in")
+
+                if not name or where not in ("path", "query"):
+                    continue
+
+                schema = deref(parameter.get("schema", {"type": "string"}), doc, frozenset())
+                if parameter.get("description"):
+                    schema["description"] = clean(parameter["description"])
+
+                properties[name] = schema
+                (path_params if where == "path" else query_params).append(name)
+
+                # A path parameter is part of the URL; there is no request to
+                # make without it, whatever the document says.
+                if where == "path" or parameter.get("required"):
+                    required.append(name)
+
+            body = body_schema(operation, doc)
+            if body is not None:
+                properties["body"] = body
+                body["description"] = clean(body.get("description") or "the request body")
+                if operation.get("requestBody", {}).get("required"):
+                    required.append("body")
+
+            summary = clean(operation.get("summary") or operation.get("operationId") or "")
+            detail = clean(operation.get("description") or "")
+            description = summary
+            if detail and detail != summary:
+                description = (summary + "\n\n" + detail) if summary else detail
+
+            operation["x-mcp-description"] = \
+                (description + "\n\n" + verb.upper() + " " + path).strip()
+            operation["x-mcp-path"] = path
+            operation["x-mcp-method"] = verb.upper()
+            operation["x-mcp-path-params"] = path_params
+            operation["x-mcp-query-params"] = query_params
+            operation["x-mcp-body"] = body is not None
+            operation["x-mcp-schema"] = clean(json.dumps({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            }))
+            tools += 1
+
+    return tools
+
+
+def main(source, out):
+    doc = yaml.safe_load(open(source))
+    tools = annotate(doc)
+    yaml.safe_dump(doc, open(out, "w"), sort_keys=False)
+    print("annotated {} operations, one tool each".format(tools))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    main(sys.argv[1], sys.argv[2])

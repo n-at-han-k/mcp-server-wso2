@@ -1,0 +1,8 @@
+.dockerignore
+.github/workflows/build-image.yml
+Dockerfile
+go.mod
+internal/wso2/client.go
+internal/wso2/client_test.go
+internal/wso2/tools.go
+main.go

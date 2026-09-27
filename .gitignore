@@ -1,0 +1,12 @@
+*.exe
+*.exe~
+*.so
+*.test
+*.out
+mcp-server-wso2
+
+# cloned upstreams, read-only: see the README
+/reference/
+
+# nix build output
+/result
